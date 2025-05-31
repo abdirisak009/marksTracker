@@ -1,12 +1,32 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import * as XLSX from "xlsx"
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
 import {
   Dialog,
   DialogContent,
@@ -48,6 +68,15 @@ export default function StudentsPage() {
   const [submitting, setSubmitting] = useState(false)
   const [editStudent, setEditStudent] = useState<StudentWithClass | null>(null)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
+  // Add state for upload dialog and results
+  const [isUploadDialogOpen, setIsUploadDialogOpen] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [uploadResults, setUploadResults] = useState<{
+    uploaded: number
+    skipped: number
+    failed: number
+    errors: Array<{ row: number; error: string; studentId?: string }>
+  }>({ uploaded: 0, skipped: 0, failed: 0, errors: [] })
 
   // Fetch classes for dropdown
   const fetchClasses = async () => {
@@ -55,7 +84,10 @@ export default function StudentsPage() {
       setClassesLoading(true)
       console.log("Fetching classes for dropdown...")
       // Fetch all columns to match Class type
-      const { data, error } = await supabase.from("classes").select("*").order("class_name")
+      const { data, error } = await supabase
+        .from("classes")
+        .select("*")
+        .order("class_name")
 
       if (error) {
         console.error("Error fetching classes:", error)
@@ -94,7 +126,10 @@ export default function StudentsPage() {
       const studentsWithStats = await Promise.all(
         (studentsData || []).map(async (student) => {
           // Get total assignments for student's class
-          const { data: assignments } = await supabase.from("assignments").select("id").eq("class_id", student.class_id)
+          const { data: assignments } = await supabase
+            .from("assignments")
+            .select("id")
+            .eq("class_id", student.class_id)
 
           // Get completed assignments (marks) for student
           const { data: marks } = await supabase
@@ -303,6 +338,112 @@ export default function StudentsPage() {
     }
   }
 
+  // Add upload handler
+  const handleFileUpload = async (file: File) => {
+    setUploading(true)
+    setUploadResults({ uploaded: 0, skipped: 0, failed: 0, errors: [] })
+    try {
+      const isCSV = file.name.endsWith(".csv")
+      let rows: any[] = []
+      if (isCSV) {
+        const text = await file.text()
+        const workbook = XLSX.read(text, { type: "string" })
+        const sheet = workbook.Sheets[workbook.SheetNames[0]]
+        rows = XLSX.utils.sheet_to_json(sheet, { defval: "" })
+      } else {
+        const data = await file.arrayBuffer()
+        const workbook = XLSX.read(data)
+        const sheet = workbook.Sheets[workbook.SheetNames[0]]
+        rows = XLSX.utils.sheet_to_json(sheet, { defval: "" })
+      }
+      let uploaded = 0,
+        skipped = 0,
+        failed = 0,
+        errors: Array<{ row: number; error: string; studentId?: string }> = []
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i]
+        const studentId =
+          row.student_id ||
+          row["student_id"] ||
+          row["Student ID"] ||
+          row["StudentId"]
+        const fullName =
+          row.full_name ||
+          row["full_name"] ||
+          row["Full Name"] ||
+          row["Name"]
+        const className =
+          row.class_name ||
+          row["class_name"] ||
+          row["Class"] ||
+          row["Class Name"]
+        const classId = row.class_id || row["class_id"]
+        if (!studentId || (!className && !classId)) {
+          failed++
+          errors.push({
+            row: i + 2,
+            error: "Missing student_id or class info",
+            studentId,
+          })
+          continue
+        }
+        // Check for duplicate student_id
+        const { data: existing } = await supabase
+          .from("students")
+          .select("id")
+          .eq("student_id", studentId)
+        if (existing && existing.length > 0) {
+          skipped++
+          continue
+        }
+        let resolvedClassId = classId
+        if (!resolvedClassId && className) {
+          const { data: classRows } = await supabase
+            .from("classes")
+            .select("id")
+            .ilike("class_name", className)
+          if (!classRows || classRows.length === 0) {
+            failed++
+            errors.push({
+              row: i + 2,
+              error: `Class not found: ${className}`,
+              studentId,
+            })
+            continue
+          }
+          resolvedClassId = classRows[0].id
+        }
+        // Insert student
+        const { error } = await supabase.from("students").insert({
+          student_id: studentId,
+          full_name: fullName || null,
+          class_id: resolvedClassId,
+        })
+        if (error) {
+          failed++
+          errors.push({ row: i + 2, error: error.message, studentId })
+        } else {
+          uploaded++
+        }
+      }
+      setUploadResults({ uploaded, skipped, failed, errors })
+      await fetchStudents()
+      toast({
+        title: "Upload Complete",
+        description: `${uploaded} uploaded, ${skipped} skipped, ${failed} failed.`,
+        variant: failed > 0 ? "destructive" : "default",
+      })
+    } catch (err: any) {
+      toast({
+        title: "Upload Error",
+        description: err.message || "Failed to process file.",
+        variant: "destructive",
+      })
+    } finally {
+      setUploading(false)
+    }
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -316,8 +457,12 @@ export default function StudentsPage() {
     <div className="space-y-6">
       <div className="flex justify-between items-center">
         <div>
-          <h2 className="text-3xl font-bold tracking-tight">Students Management</h2>
-          <p className="text-muted-foreground">Manage student registrations and view their performance</p>
+          <h2 className="text-3xl font-bold tracking-tight">
+            Students Management
+          </h2>
+          <p className="text-muted-foreground">
+            Manage student registrations and view their performance
+          </p>
         </div>
         <Dialog open={isAddDialogOpen} onOpenChange={handleDialogOpen}>
           <DialogTrigger asChild>
@@ -330,7 +475,8 @@ export default function StudentsPage() {
             <DialogHeader>
               <DialogTitle>Add New Student</DialogTitle>
               <DialogDescription>
-                Register a new student in the system. Only Student ID and Class are required.
+                Register a new student in the system. Only Student ID and Class are
+                required.
               </DialogDescription>
             </DialogHeader>
             <div className="grid gap-4 py-4">
@@ -339,12 +485,15 @@ export default function StudentsPage() {
                 <Input
                   id="name"
                   value={newStudent.full_name}
-                  onChange={(e) => setNewStudent({ ...newStudent, full_name: e.target.value })}
+                  onChange={(e) =>
+                    setNewStudent({ ...newStudent, full_name: e.target.value })
+                  }
                   placeholder="Enter student's full name (optional)"
                   autoComplete="off"
                 />
                 <p className="text-xs text-muted-foreground">
-                  Leave blank if name is not available. Student will be identified by ID.
+                  Leave blank if name is not available. Student will be identified
+                  by ID.
                 </p>
               </div>
               <div className="grid gap-2">
@@ -352,12 +501,16 @@ export default function StudentsPage() {
                 <Input
                   id="studentId"
                   value={newStudent.studentId}
-                  onChange={(e) => setNewStudent({ ...newStudent, studentId: e.target.value })}
+                  onChange={(e) =>
+                    setNewStudent({ ...newStudent, studentId: e.target.value })
+                  }
                   placeholder="Enter unique student ID"
                 />
                 {errors.studentId && (
                   <Alert className="py-2">
-                    <AlertDescription className="text-sm text-red-600">{errors.studentId}</AlertDescription>
+                    <AlertDescription className="text-sm text-red-600">
+                      {errors.studentId}
+                    </AlertDescription>
                   </Alert>
                 )}
               </div>
@@ -366,7 +519,9 @@ export default function StudentsPage() {
                 {classesLoading ? (
                   <div className="flex items-center gap-2 p-2 border rounded">
                     <Loader2 className="h-4 w-4 animate-spin" />
-                    <span className="text-sm text-muted-foreground">Loading classes...</span>
+                    <span className="text-sm text-muted-foreground">
+                      Loading classes...
+                    </span>
                   </div>
                 ) : classes.length === 0 ? (
                   <Alert className="py-2">
@@ -397,7 +552,9 @@ export default function StudentsPage() {
                 )}
                 {errors.classId && (
                   <Alert className="py-2">
-                    <AlertDescription className="text-sm text-red-600">{errors.classId}</AlertDescription>
+                    <AlertDescription className="text-sm text-red-600">
+                      {errors.classId}
+                    </AlertDescription>
                   </Alert>
                 )}
                 {/* Debug info */}
@@ -409,11 +566,20 @@ export default function StudentsPage() {
               </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={closeDialog} disabled={submitting}>
+              <Button
+                variant="outline"
+                onClick={closeDialog}
+                disabled={submitting}
+              >
                 Cancel
               </Button>
-              <Button onClick={handleAddStudent} disabled={submitting || classes.length === 0}>
-                {submitting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+              <Button
+                onClick={handleAddStudent}
+                disabled={submitting || classes.length === 0}
+              >
+                {submitting ? (
+                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                ) : null}
                 Add Student
               </Button>
             </DialogFooter>
@@ -424,7 +590,14 @@ export default function StudentsPage() {
       <Card>
         <CardHeader>
           <CardTitle>Student List</CardTitle>
-          <CardDescription>View and manage all registered students</CardDescription>
+          <CardDescription>
+            View and manage all registered students
+          </CardDescription>
+          <div className="flex justify-end mt-2">
+            <Button variant="secondary" onClick={() => setIsUploadDialogOpen(true)}>
+              Upload Excel
+            </Button>
+          </div>
         </CardHeader>
         <CardContent>
           <div className="flex gap-4 mb-4">
@@ -476,7 +649,9 @@ export default function StudentsPage() {
                   </TableCell>
                   <TableCell>{student.student_id}</TableCell>
                   <TableCell>
-                    <Badge variant="secondary">{student.classes?.class_name || "-"}</Badge>
+                    <Badge variant="secondary">
+                      {student.classes?.class_name || "-"}
+                    </Badge>
                   </TableCell>
                   <TableCell>
                     {student.completedAssignments}/{student.totalAssignments}
@@ -484,26 +659,37 @@ export default function StudentsPage() {
                   <TableCell>
                     <Badge
                       variant={
-                        typeof student.averageScore === "number" && !isNaN(student.averageScore)
+                        typeof student.averageScore === "number" &&
+                        !isNaN(student.averageScore)
                           ? student.averageScore >= 80
                             ? "default"
                             : student.averageScore >= 60
-                              ? "secondary"
-                              : "destructive"
+                            ? "secondary"
+                            : "destructive"
                           : "secondary"
                       }
                     >
-                      {typeof student.averageScore === "number" && !isNaN(student.averageScore)
+                      {typeof student.averageScore === "number" &&
+                      !isNaN(student.averageScore)
                         ? student.averageScore.toFixed(1)
-                        : "-"}%
+                        : "-"}
+                      %
                     </Badge>
                   </TableCell>
                   <TableCell>
                     <div className="flex gap-2">
-                      <Button variant="outline" size="sm" onClick={() => handleEditStudent(student)}>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleEditStudent(student)}
+                      >
                         <Edit className="h-4 w-4" />
                       </Button>
-                      <Button variant="outline" size="sm" onClick={() => handleDeleteStudent(student.id)}>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleDeleteStudent(student.id)}
+                      >
                         <Trash2 className="h-4 w-4" />
                       </Button>
                     </div>
@@ -535,7 +721,9 @@ export default function StudentsPage() {
                 <Input
                   id="edit-full-name"
                   value={editStudent.full_name || ""}
-                  onChange={(e) => setEditStudent({ ...editStudent, full_name: e.target.value })}
+                  onChange={(e) =>
+                    setEditStudent({ ...editStudent, full_name: e.target.value })
+                  }
                   placeholder="Enter student's full name"
                 />
               </div>
@@ -544,7 +732,9 @@ export default function StudentsPage() {
                 <Input
                   id="edit-student-id"
                   value={editStudent.student_id}
-                  onChange={(e) => setEditStudent({ ...editStudent, student_id: e.target.value })}
+                  onChange={(e) =>
+                    setEditStudent({ ...editStudent, student_id: e.target.value })
+                  }
                   placeholder="Enter student ID"
                 />
               </div>
@@ -552,7 +742,9 @@ export default function StudentsPage() {
                 <Label htmlFor="edit-class">Class</Label>
                 <Select
                   value={editStudent.class_id}
-                  onValueChange={(value) => setEditStudent({ ...editStudent, class_id: value })}
+                  onValueChange={(value) =>
+                    setEditStudent({ ...editStudent, class_id: value })
+                  }
                 >
                   <SelectTrigger>
                     <SelectValue placeholder="Select class" />
@@ -569,12 +761,120 @@ export default function StudentsPage() {
             </div>
           )}
           <DialogFooter>
-            <Button variant="outline" onClick={() => setIsEditDialogOpen(false)}>
+            <Button
+              variant="outline"
+              onClick={() => setIsEditDialogOpen(false)}
+            >
               Cancel
             </Button>
-            <Button onClick={handleUpdateStudent} disabled={submitting || !editStudent}>
-              {submitting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+            <Button
+              onClick={handleUpdateStudent}
+              disabled={submitting || !editStudent}
+            >
+              {submitting ? (
+                <Loader2 className="h-4 w-4 animate-spin mr-2" />
+              ) : null}
               Save Changes
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Upload Students Dialog */}
+      <Dialog open={isUploadDialogOpen} onOpenChange={setIsUploadDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Upload Students</DialogTitle>
+            <DialogDescription>
+              Upload a CSV or Excel file to register multiple students at once.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4 py-4">
+            <div className="grid gap-2">
+              <Label htmlFor="file-upload">Select File</Label>
+              <Input
+                id="file-upload"
+                type="file"
+                accept=".csv, .xlsx, .xls"
+                onChange={(e) => {
+                  const file = e.target.files?.[0]
+                  if (file) {
+                    handleFileUpload(file)
+                  }
+                }}
+              />
+            </div>
+            {uploading && (
+              <div className="flex items-center gap-2">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                <span className="text-sm text-muted-foreground">
+                  Processing file...
+                </span>
+              </div>
+            )}
+            {!uploading && (
+              <div className="text-sm text-muted-foreground">
+                Supported formats: CSV, XLSX, XLS. Max size: 10MB.
+              </div>
+            )}
+            {uploadResults.uploaded > 0 && (
+              <Alert className="py-2">
+                <AlertDescription className="text-sm text-green-600">
+                  {uploadResults.uploaded} students uploaded successfully.
+                </AlertDescription>
+              </Alert>
+            )}
+            {uploadResults.skipped > 0 && (
+              <Alert className="py-2">
+                <AlertDescription className="text-sm text-yellow-600">
+                  {uploadResults.skipped} students skipped (duplicate Student ID).
+                </AlertDescription>
+              </Alert>
+            )}
+            {uploadResults.failed > 0 && (
+              <Alert className="py-2">
+                <AlertDescription className="text-sm text-red-600">
+                  {uploadResults.failed} students failed to upload.
+                </AlertDescription>
+              </Alert>
+            )}
+            {uploadResults.errors.length > 0 && (
+              <div className="text-sm text-red-600">
+                <p className="font-medium">Errors:</p>
+                <ul className="list-disc list-inside">
+                  {uploadResults.errors.map((error) => (
+                    <li key={error.row}>
+                      Row {error.row}: {error.error}{" "}
+                      {error.studentId && `(Student ID: ${error.studentId})`}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setIsUploadDialogOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => {
+                const fileInput = document.getElementById(
+                  "file-upload"
+                ) as HTMLInputElement
+                const file = fileInput.files?.[0]
+                if (file) {
+                  handleFileUpload(file)
+                }
+              }}
+              disabled={uploading}
+            >
+              {uploading ? (
+                <Loader2 className="h-4 w-4 animate-spin mr-2" />
+              ) : null}
+              Upload Students
             </Button>
           </DialogFooter>
         </DialogContent>
